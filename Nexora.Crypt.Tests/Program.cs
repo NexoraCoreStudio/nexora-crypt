@@ -16,6 +16,7 @@ try
     VaultCreationResult created = VaultStore.Create(path, "1234");
     Require(created.RecoveryCode.Replace("-", "").Length == 64, "Code de 256 bits attendu");
     Require(File.Exists(path), "Le coffre doit exister");
+    Require(VaultStore.IsAuthorizedOnThisWindowsProfile(path), "Profil Windows initial non reconnu");
     Require(!File.Exists(Path.Combine(tempDir, "ui-pin.json")), "PIN ne doit pas etre dans un JSON externe");
 
     using (var session = VaultStore.OpenOnAuthorizedComputer(path, "1234"))
@@ -36,6 +37,7 @@ try
         Require(recovered.ReadFile("keys/clef1/private.key")!.SequenceEqual(new byte[] { 23, 42, 99 }),
             "Cle FIDO2 non retrouvee");
         recovered.AuthorizeThisComputer();
+        Require(VaultStore.IsAuthorizedOnThisWindowsProfile(path), "Autorisation Windows non detectee");
         Require(recovered.GetAudit().Any(x => x.EventType == "windows-profile-authorized"),
             "Autorisation non journalisee");
         recovered.ChangePin("1234", "6789");

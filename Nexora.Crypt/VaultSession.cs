@@ -74,13 +74,49 @@ public sealed class VaultSession : IDisposable
         _envelope.AuthorizedDevices.Add(new DeviceKeySlot { DpapiCiphertext = Convert.ToBase64String(wrapped) });
         AppendAudit(_document, "windows-profile-authorized");
         Save();
+        AuthorizedProfileMarker.TryRemember(_envelope);
+    }
+
+    /// <summary>Enforce the same persistent lockout when approving a FIDO2 operation.</summary>
+    public bool VerifyPin(string pin, out DateTimeOffset blockedUntil)
+    {
+        EnsureOpen();
+        if (_document.LockedUntilUtc is { } locked && DateTimeOffset.UtcNow < locked)
+        {
+            blockedUntil = locked;
+            return false;
+        }
+        if (VaultCrypto.CheckPin(_document, pin))
+        {
+            _document.FailedAttempts = 0;
+            _document.LockedUntilUtc = null;
+            blockedUntil = DateTimeOffset.MinValue;
+            Save();
+            return true;
+        }
+        _document.FailedAttempts = Math.Min(_document.FailedAttempts + 1, 100);
+        _document.LockedUntilUtc = VaultCrypto.NextLockoutUtc(_document.FailedAttempts);
+        blockedUntil = _document.LockedUntilUtc.Value;
+        AppendAudit(_document, "pin-rejected");
+        Save();
+        return false;
+    }
+
+    /// <summary>Allowlisted, non-secret operational events inside encrypted payload.</summary>
+    public void RecordAudit(string eventType)
+    {
+        EnsureOpen();
+        if (eventType.Length is < 1 or > 48 || eventType.Any(c => !(c is >= 'a' and <= 'z' or >= '0' and <= '9' or '-')))
+            throw new ArgumentException("Invalid audit event type.", nameof(eventType));
+        AppendAudit(_document, eventType);
+        Save();
     }
 
     public void ChangePin(string oldPin, string newPin)
     {
         EnsureOpen();
-        if (!VaultCrypto.CheckPin(_document, oldPin))
-            throw new UnauthorizedAccessException("L'ancien PIN est incorrect.");
+        if (!VerifyPin(oldPin, out var blocked))
+            throw new InvalidVaultPinException(blocked);
         VaultCrypto.SetPin(_document, newPin);
         AppendAudit(_document, "pin-changed");
         Save();

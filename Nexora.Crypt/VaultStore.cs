@@ -45,6 +45,7 @@ public static class VaultStore
                 };
                 VaultPersistence.EncryptDocument(envelope, document, masterKey);
                 VaultPersistence.WriteEnvelope(path, envelope, overwrite: false);
+                AuthorizedProfileMarker.TryRemember(envelope);
                 return new VaultCreationResult(path, recoveryCode);
             }
             finally
@@ -58,6 +59,41 @@ public static class VaultStore
             CryptographicOperations.ZeroMemory(masterKey);
             VaultPersistence.ReleaseLock(@lock);
         }
+    }
+
+    /// <summary>
+    /// True only if the current Windows profile can recover a registered key slot
+    /// AND that key validates the encrypted vault payload. A hidden AppData marker
+    /// is recorded as a local hint but is NEVER sufficient to authorize a profile.
+    /// Works with existing 1.2 vaults; it does not require a vault migration.
+    /// </summary>
+    public static bool IsAuthorizedOnThisWindowsProfile(string vaultPath)
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        var envelope = VaultPersistence.Read(VaultPersistence.AbsolutePath(vaultPath));
+        bool localHintExists = AuthorizedProfileMarker.IsKnown(envelope);
+        foreach (var slot in envelope.AuthorizedDevices)
+        {
+            byte[]? candidate = null;
+            try
+            {
+                candidate = VaultCrypto.UnprotectForThisWindowsAccount(Convert.FromBase64String(slot.DpapiCiphertext));
+                if (candidate.Length != 32) continue;
+                byte[] authenticatedPayload = VaultCrypto.DecryptPayload(candidate, envelope.Payload);
+                CryptographicOperations.ZeroMemory(authenticatedPayload);
+                if (!localHintExists) AuthorizedProfileMarker.TryRemember(envelope);
+                return true;
+            }
+            catch (Exception ex) when (ex is CryptographicException or FormatException)
+            {
+                // A slot bound to a different Windows profile is not usable here.
+            }
+            finally
+            {
+                if (candidate is not null) CryptographicOperations.ZeroMemory(candidate);
+            }
+        }
+        return false;
     }
 
     public static VaultSession OpenOnAuthorizedComputer(string vaultPath, string pin)
@@ -82,7 +118,9 @@ public static class VaultStore
         }
         if (masterKey is null)
             throw new UnauthorizedAccessException("Ce PC/compte Windows n'est pas autorise. Code de recuperation necessaire.");
-        return Authenticate(path, envelope, masterKey, pin);
+        var session = Authenticate(path, envelope, masterKey, pin);
+        AuthorizedProfileMarker.TryRemember(envelope);
+        return session;
     }
 
     public static VaultSession OpenWithRecoveryCode(string vaultPath, string pin, string recoveryCode)
