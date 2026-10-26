@@ -8,6 +8,7 @@ internal static class VaultPersistence
 {
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = false };
     private const int MaxEncryptedFileBytes = 64 * 1024 * 1024;
+
     internal static string AbsolutePath(string path)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
@@ -52,14 +53,31 @@ internal static class VaultPersistence
         if (info.Length > MaxEncryptedFileBytes) throw new InvalidDataException("Coffre trop volumineux.");
         var envelope = JsonSerializer.Deserialize<VaultEnvelope>(File.ReadAllBytes(path), Options)
             ?? throw new InvalidDataException("Contenu de coffre invalide.");
-        if (envelope.Format != "NEXORA-VAULT" || envelope.Version != 1 || string.IsNullOrWhiteSpace(envelope.RevisionToken))
+        if (envelope.Format != "NEXORA-VAULT" || envelope.Version is not (1 or 2) ||
+            string.IsNullOrWhiteSpace(envelope.RevisionToken))
             throw new InvalidDataException("Version de coffre non prise en charge.");
+        if (envelope.Version == 2 && (string.IsNullOrWhiteSpace(envelope.KdfSalt) ||
+            Convert.FromBase64String(envelope.KdfSalt).Length != 32))
+            throw new InvalidDataException("En-tete Fortress v2 invalide.");
         return envelope;
     }
 
+    internal static void VerifyPayload(byte[] masterKey, VaultEnvelope envelope)
+    {
+        byte[] serialized = DecryptDocument(masterKey, envelope);
+        CryptographicOperations.ZeroMemory(serialized);
+    }
+
+    private static byte[] DecryptDocument(byte[] masterKey, VaultEnvelope envelope) => envelope.Version switch
+    {
+        1 => VaultCrypto.DecryptPayload(masterKey, envelope.Payload),
+        2 => VaultFortressCrypto.DecryptManifest(envelope, masterKey),
+        _ => throw new InvalidDataException("Version de coffre inconnue.")
+    };
+
     internal static VaultDocument Decode(byte[] masterKey, VaultEnvelope envelope)
     {
-        byte[] serialized = VaultCrypto.DecryptPayload(masterKey, envelope.Payload);
+        byte[] serialized = DecryptDocument(masterKey, envelope);
         try
         {
             return JsonSerializer.Deserialize<VaultDocument>(serialized, Options)
@@ -71,7 +89,15 @@ internal static class VaultPersistence
     internal static void EncryptDocument(VaultEnvelope envelope, VaultDocument document, byte[] masterKey)
     {
         byte[] plaintext = JsonSerializer.SerializeToUtf8Bytes(document, Options);
-        try { envelope.Payload = VaultCrypto.EncryptPayload(masterKey, plaintext); }
+        try
+        {
+            envelope.Payload = envelope.Version switch
+            {
+                1 => VaultCrypto.EncryptPayload(masterKey, plaintext),
+                2 => VaultFortressCrypto.EncryptManifest(envelope, masterKey, plaintext),
+                _ => throw new InvalidDataException("Version de coffre inconnue.")
+            };
+        }
         finally { CryptographicOperations.ZeroMemory(plaintext); }
     }
 

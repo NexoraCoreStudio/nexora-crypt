@@ -1,8 +1,6 @@
-using System.Text.Json.Serialization;
-
 namespace Nexora.Crypt;
 
-/// <summary>Encrypted vault content. This object is NEVER written to disk in plaintext.</summary>
+/// <summary>Encrypted vault content. Never persisted in plaintext.</summary>
 internal sealed class VaultDocument
 {
     public string PinSalt { get; set; } = "";
@@ -13,12 +11,16 @@ internal sealed class VaultDocument
     public List<VaultAuditEntry> Audit { get; set; } = [];
 }
 
-/// <summary>Only cryptographic headers; actual key names, settings and audit stay encrypted.</summary>
+/// <summary>
+/// V1: single encrypted document. V2: authenticated HKDF-separated encrypted manifest
+/// containing individually encrypted key-wrapped items. Header values are not secret.
+/// </summary>
 internal sealed class VaultEnvelope
 {
     public string Format { get; set; } = "NEXORA-VAULT";
     public int Version { get; set; } = 1;
     public string RevisionToken { get; set; } = Guid.NewGuid().ToString("N");
+    public string KdfSalt { get; set; } = ""; // v2 only; 32 random bytes, base64 encoded
     public List<DeviceKeySlot> AuthorizedDevices { get; set; } = [];
     public string RecoverySalt { get; set; } = "";
     public EncryptedBlob RecoveryKeySlot { get; set; } = new();
@@ -39,28 +41,18 @@ internal sealed class EncryptedBlob
 }
 
 public sealed record VaultAuditEntry(DateTimeOffset WhenUtc, string EventType);
-
-/// <summary>Show the 256-bit recovery code to the user ONCE, then do not persist it.</summary>
 public sealed record VaultCreationResult(string VaultPath, string RecoveryCode);
 
 public sealed class VaultLockedException : InvalidOperationException
 {
     public VaultLockedException(DateTimeOffset lockedUntilUtc)
-        : base($"Nexora est bloque jusqu'au {lockedUntilUtc:O}.")
-    {
-        LockedUntilUtc = lockedUntilUtc;
-    }
-
+        : base($"Nexora est bloque jusqu'au {lockedUntilUtc:O}.") => LockedUntilUtc = lockedUntilUtc;
     public DateTimeOffset LockedUntilUtc { get; }
 }
 
 public sealed class InvalidVaultPinException : UnauthorizedAccessException
 {
     public InvalidVaultPinException(DateTimeOffset lockedUntilUtc)
-        : base($"Code PIN incorrect. Prochaine tentative a partir du {lockedUntilUtc:O}.")
-    {
-        LockedUntilUtc = lockedUntilUtc;
-    }
-
+        : base($"Code PIN incorrect. Prochaine tentative a partir du {lockedUntilUtc:O}.") => LockedUntilUtc = lockedUntilUtc;
     public DateTimeOffset LockedUntilUtc { get; }
 }

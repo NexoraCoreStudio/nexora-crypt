@@ -257,7 +257,9 @@ public static class VaultBackupService
             throw new InvalidDataException("Taille du coffre invalide.");
         var vault = JsonSerializer.Deserialize<VaultEnvelope>(bytes, JsonOptions)
             ?? throw new InvalidDataException("Coffre absent de la sauvegarde.");
-        if (vault.Format != "NEXORA-VAULT" || vault.Version != 1 ||
+        if (vault.Format != "NEXORA-VAULT" || vault.Version is not (1 or 2) ||
+            (vault.Version == 2 && (string.IsNullOrWhiteSpace(vault.KdfSalt) ||
+                Convert.FromBase64String(vault.KdfSalt).Length != 32)) ||
             string.IsNullOrWhiteSpace(vault.RevisionToken) ||
             vault.AuthorizedDevices is null || vault.AuthorizedDevices.Count is < 1 or > 16 ||
             vault.RecoveryKeySlot is null || vault.Payload is null ||

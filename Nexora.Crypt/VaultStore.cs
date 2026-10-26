@@ -3,18 +3,16 @@ using System.Security.Cryptography;
 namespace Nexora.Crypt;
 
 /// <summary>
-/// One encrypted portable file. DPAPI enables access only on an enrolled Windows user/profile;
-/// the 256-bit recovery code can authorize another Windows computer after PIN verification.
-/// The short PIN and local lockout are APPLICATION-LEVEL protections, NOT TPM enforced.
+/// Portable AES-GCM vault. DPAPI restricts the local account; a 256-bit recovery code
+/// authorizes use on another Windows profile after PIN verification. The short PIN and
+/// lockout are APPLICATION-level controls, not TPM-backed authentication.
+/// Fortress v2 is opt-in and NEVER automatically migrates a user's vault.
 /// </summary>
 public static class VaultStore
 {
     public static string DefaultVaultPath => Path.Combine(AppContext.BaseDirectory, "Nexora.vault");
 
-    /// <summary>
-    /// Create a new vault adjacent to Nexora.exe by passing Path.Combine(AppContext.BaseDirectory,"Nexora.vault").
-    /// Save the returned code OFFLINE: it is not stored in plaintext and is never recoverable.
-    /// </summary>
+    /// <summary>Create a backward-compatible v1 vault. Store recovery code offline.</summary>
     public static VaultCreationResult Create(string vaultPath, string initialPin)
     {
         string path = VaultPersistence.AbsolutePath(vaultPath);
@@ -61,12 +59,10 @@ public static class VaultStore
         }
     }
 
-    /// <summary>
-    /// True only if the current Windows profile can recover a registered key slot
-    /// AND that key validates the encrypted vault payload. A hidden AppData marker
-    /// is recorded as a local hint but is NEVER sufficient to authorize a profile.
-    /// Works with existing 1.2 vaults; it does not require a vault migration.
-    /// </summary>
+    public static int ReadVaultFormatVersion(string vaultPath) =>
+        VaultPersistence.Read(VaultPersistence.AbsolutePath(vaultPath)).Version;
+
+    /// <summary>Actual DPAPI key slot + authenticated payload, not a local marker.</summary>
     public static bool IsAuthorizedOnThisWindowsProfile(string vaultPath)
     {
         if (!OperatingSystem.IsWindows()) return false;
@@ -79,14 +75,13 @@ public static class VaultStore
             {
                 candidate = VaultCrypto.UnprotectForThisWindowsAccount(Convert.FromBase64String(slot.DpapiCiphertext));
                 if (candidate.Length != 32) continue;
-                byte[] authenticatedPayload = VaultCrypto.DecryptPayload(candidate, envelope.Payload);
-                CryptographicOperations.ZeroMemory(authenticatedPayload);
+                VaultPersistence.VerifyPayload(candidate, envelope);
                 if (!localHintExists) AuthorizedProfileMarker.TryRemember(envelope);
                 return true;
             }
             catch (Exception ex) when (ex is CryptographicException or FormatException)
             {
-                // A slot bound to a different Windows profile is not usable here.
+                // Different profile or tampered key slot.
             }
             finally
             {
@@ -114,7 +109,7 @@ public static class VaultStore
                 }
                 break;
             }
-            catch (CryptographicException) { /* Not the Windows profile originally enrolled */ }
+            catch (CryptographicException) { }
         }
         if (masterKey is null)
             throw new UnauthorizedAccessException("Ce PC/compte Windows n'est pas autorise. Code de recuperation necessaire.");
@@ -135,13 +130,12 @@ public static class VaultStore
         {
             throw new UnauthorizedAccessException("Code de recuperation invalide ou coffre modifie.", ex);
         }
-        finally { CryptographicOperations.ZeroMemory(recoveryKey); }
+        finally { CryptographicOperations.ZeroMemory(recoveryKey); CryptographicOperations.ZeroMemory(salt); }
         if (masterKey.Length != 32)
         {
             CryptographicOperations.ZeroMemory(masterKey);
             throw new CryptographicException("Cle maitresse invalide.");
         }
-        // Recovery does not silently enroll a computer; the user must explicitly call AuthorizeThisComputer.
         return Authenticate(path, envelope, masterKey, pin);
     }
 

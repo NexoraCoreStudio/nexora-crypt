@@ -113,6 +113,91 @@ try
     }
     catch (IOException) { }
 
+    Console.WriteLine("[TEST] Fortress v2 : echec de migration non destructive");
+    using (var untouched = VaultStore.OpenOnAuthorizedComputer(path, "6789"))
+    {
+        try
+        {
+            VaultFortressMigration.Migrate(untouched, tempDir);
+            throw new Exception("Migration dans le dossier du coffre acceptee");
+        }
+        catch (IOException) { }
+        Require(!untouched.IsFortressV2 && VaultStore.ReadVaultFormatVersion(path) == 1,
+            "Une migration refusee ne doit pas modifier le coffre v1");
+    }
+
+    Console.WriteLine("[TEST] Fortress v2 : sauvegarde v1, migration, cles uniques et lecture");
+    string fortressPath = Path.Combine(tempDir, "Fortress.vault");
+    File.Copy(path, fortressPath, overwrite: false);
+    string fortressBackups = Path.Combine(tempDir, "Fortress-Backups");
+    FortressMigrationResult migration;
+    using (var legacy = VaultStore.OpenOnAuthorizedComputer(fortressPath, "6789"))
+    {
+        legacy.WriteFile("sticks/test/credentials/a.cred", new byte[] { 41, 42, 43, 44 });
+        migration = VaultFortressMigration.Migrate(legacy, fortressBackups);
+        Require(legacy.IsFortressV2 && migration.MigratedItems == 3, "Migration partielle");
+        Require(legacy.ReadFile("keys/clef1/private.key")!.SequenceEqual(new byte[] { 23, 42, 99 }),
+            "Cle privee perdue pendant la migration");
+        legacy.WriteFile("keys/clef1/updated.key", new byte[] { 1, 2, 3, 4, 5 });
+        Require(legacy.ReadFile("keys/clef1/updated.key")!.SequenceEqual(new byte[] { 1, 2, 3, 4, 5 }),
+            "Ecriture v2 invalide");
+        try
+        {
+            VaultFortressMigration.Migrate(legacy, fortressBackups);
+            throw new Exception("Double migration acceptee");
+        }
+        catch (InvalidOperationException) { }
+    }
+    Require(VaultStore.ReadVaultFormatVersion(fortressPath) == 2, "Version 2 attendue");
+    Require(File.Exists(migration.PreservedV1Vault), "Coffre v1 de secours absent");
+    Require(VaultStore.ReadVaultFormatVersion(migration.PreservedV1Vault) == 1, "Sauvegarde source doit rester v1");
+    using (var oldCopy = VaultStore.OpenOnAuthorizedComputer(migration.PreservedV1Vault, "6789"))
+        Require(oldCopy.ReadFile("sticks/test/credentials/a.cred")!.SequenceEqual(new byte[] { 41, 42, 43, 44 }),
+            "La sauvegarde v1 a ete alteree");
+    string fortressRaw = File.ReadAllText(fortressPath);
+    Require(!fortressRaw.Contains("clef1", StringComparison.Ordinal) &&
+            !fortressRaw.Contains("SECRET-CONFIG-EXAMPLE", StringComparison.Ordinal),
+        "Secret ou chemin visible en clair dans le fichier Fortress");
+    Require(VaultStore.IsAuthorizedOnThisWindowsProfile(fortressPath), "DPAPI v2 ne fonctionne pas");
+    using (var recoveredV2 = VaultStore.OpenWithRecoveryCode(fortressPath, "6789", created.RecoveryCode))
+    {
+        Require(recoveredV2.ReadFile("keys/clef1/private.key")!.SequenceEqual(new byte[] { 23, 42, 99 }),
+            "Recuperation 256 bits incompatible avec Fortress v2");
+        recoveredV2.ChangePin("6789", "1357");
+    }
+    using (var reopened = VaultStore.OpenOnAuthorizedComputer(fortressPath, "1357"))
+    {
+        Require(reopened.ReadFile("keys/clef1/updated.key")!.SequenceEqual(new byte[] { 1, 2, 3, 4, 5 }),
+            "Donnees v2 perdues apres reouverture et changement de PIN");
+        reopened.DeleteFile("keys/clef1/updated.key");
+        Require(reopened.ReadFile("keys/clef1/updated.key") is null, "Suppression v2 echouee");
+    }
+    Console.WriteLine("[TEST] Fortress v2 : sauvegarde .nxbackup et restauration");
+    string fortressArchive = Path.Combine(tempDir, "Fortress.nxbackup");
+    VaultBackupService.CreateBackup(fortressPath, fortressArchive, backupPassword);
+    VaultBackupService.VerifyBackupPassword(fortressArchive, backupPassword);
+    string fortressRestored = Path.Combine(tempDir, "Fortress-Restored.vault");
+    VaultBackupService.RestoreBackup(fortressArchive, fortressRestored, backupPassword, fortressBackups);
+    Require(VaultStore.ReadVaultFormatVersion(fortressRestored) == 2, "Backup v2 restaure en mauvaise version");
+    using (var restoredV2 = VaultStore.OpenOnAuthorizedComputer(fortressRestored, "1357"))
+        Require(restoredV2.ReadFile("keys/clef1/private.key")!.SequenceEqual(new byte[] { 23, 42, 99 }),
+            "La sauvegarde Fortress n'a pas conserve les cles FIDO2");
+
+    Console.WriteLine("[TEST] Fortress v2 : corruption de l'enveloppe refusee");
+    string tamperedV2Path = Path.Combine(tempDir, "TamperedV2.vault");
+    string tamperedV2 = File.ReadAllText(fortressPath);
+    int cipherAt = tamperedV2.LastIndexOf("\"Ciphertext\":\"", StringComparison.Ordinal);
+    Require(cipherAt >= 0, "Ciphertext v2 absent");
+    cipherAt += "\"Ciphertext\":\"".Length;
+    tamperedV2 = tamperedV2[..cipherAt] + (tamperedV2[cipherAt] == 'A' ? 'B' : 'A') + tamperedV2[(cipherAt + 1)..];
+    File.WriteAllText(tamperedV2Path, tamperedV2);
+    try
+    {
+        using var corrupted = VaultStore.OpenOnAuthorizedComputer(tamperedV2Path, "1357");
+        throw new Exception("Corruption de coffre v2 acceptee");
+    }
+    catch (CryptographicException) { }
+
     Console.WriteLine("[TEST] Mauvais code de recuperation refuse");
     try
     {

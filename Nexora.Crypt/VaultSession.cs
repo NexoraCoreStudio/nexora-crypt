@@ -2,12 +2,16 @@ using System.Security.Cryptography;
 
 namespace Nexora.Crypt;
 
-/// <summary>Use from one caller at a time. Disposing clears the master key as far as managed memory permits.</summary>
+/// <summary>
+/// Authenticated vault session. The storage API remains identical for FIDO2 consumers.
+/// V1 uses encrypted outer payload. Fortress v2 additionally encrypts each item using
+/// its own random data key. Callers must synchronize access to a session.
+/// </summary>
 public sealed class VaultSession : IDisposable
 {
     private readonly string _path;
-    private readonly VaultEnvelope _envelope;
-    private readonly VaultDocument _document;
+    private VaultEnvelope _envelope;
+    private VaultDocument _document;
     private readonly byte[] _masterKey;
     private bool _disposed;
 
@@ -18,6 +22,8 @@ public sealed class VaultSession : IDisposable
         _document = document;
         _masterKey = masterKey;
     }
+
+    public bool IsFortressV2 { get { EnsureOpen(); return _envelope.Version == 2; } }
 
     public IReadOnlyList<string> ListPaths()
     {
@@ -35,9 +41,13 @@ public sealed class VaultSession : IDisposable
     {
         EnsureOpen();
         ValidateLogicalPath(logicalPath);
-        return _document.Items.TryGetValue(logicalPath, out string? encoded)
-            ? Convert.FromBase64String(encoded)
-            : null;
+        if (!_document.Items.TryGetValue(logicalPath, out string? encoded)) return null;
+        return _envelope.Version switch
+        {
+            1 => Convert.FromBase64String(encoded),
+            2 => VaultFortressCrypto.DecryptItem(_envelope, _masterKey, logicalPath, encoded),
+            _ => throw new InvalidDataException("Version du coffre inconnue.")
+        };
     }
 
     public void WriteFile(string logicalPath, byte[] contents)
@@ -49,7 +59,12 @@ public sealed class VaultSession : IDisposable
             throw new ArgumentOutOfRangeException(nameof(contents), "Fichier limite a 16 Mo.");
         if (!_document.Items.ContainsKey(logicalPath) && _document.Items.Count >= 10_000)
             throw new InvalidOperationException("Nombre maximal de fichiers atteint.");
-        _document.Items[logicalPath] = Convert.ToBase64String(contents);
+        _document.Items[logicalPath] = _envelope.Version switch
+        {
+            1 => Convert.ToBase64String(contents),
+            2 => VaultFortressCrypto.EncryptItem(_envelope, _masterKey, logicalPath, contents),
+            _ => throw new InvalidDataException("Version du coffre inconnue.")
+        };
         AppendAudit(_document, "vault-entry-written");
         Save();
     }
@@ -62,6 +77,22 @@ public sealed class VaultSession : IDisposable
         AppendAudit(_document, "vault-entry-removed");
         Save();
         return true;
+    }
+
+    /// <summary>
+    /// Explicit opt-in, with verified immutable V1 backup. Call only when USB/IP has been
+    /// detached and the GUI's shared VaultAccessController.SyncRoot is held.
+    /// The session remains open and switches to V2 only after a verified atomic commit.
+    /// </summary>
+    internal FortressMigrationResult MigrateToFortressV2(string backupDirectory)
+    {
+        EnsureOpen();
+        if (_envelope.Version != 1) throw new InvalidOperationException("Ce coffre utilise deja Fortress v2.");
+        var result = VaultFortressMigration.Perform(_path, _envelope, _document, _masterKey,
+            backupDirectory, out var migratedEnvelope, out var migratedDocument);
+        _envelope = migratedEnvelope;
+        _document = migratedDocument;
+        return result;
     }
 
     /// <summary>Explicitly register the CURRENT Windows user/profile as an authorized endpoint.</summary>
@@ -169,7 +200,6 @@ public sealed class VaultSession : IDisposable
     }
 }
 
-/// <summary>Allowlisted audit types: no arbitrary user data or secret content.</summary>
 public enum VaultSecurityEvent
 {
     SuspiciousInput,
