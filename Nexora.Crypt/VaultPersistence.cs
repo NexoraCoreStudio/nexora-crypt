@@ -109,9 +109,20 @@ internal static class VaultPersistence
             string current = Read(path).RevisionToken;
             if (current != envelope.RevisionToken)
                 throw new IOException("Le coffre a ete modifie par un autre processus. Fermez-le puis rouvrez-le.");
-            envelope.RevisionToken = Guid.NewGuid().ToString("N");
-            EncryptDocument(envelope, document, masterKey);
-            WriteEnvelope(path, envelope, overwrite: true);
+            var revision = envelope.RevisionToken;
+            var payload = envelope.Payload;
+            try
+            {
+                envelope.RevisionToken = Guid.NewGuid().ToString("N");
+                EncryptDocument(envelope, document, masterKey);
+                WriteEnvelope(path, envelope, overwrite: true);
+            }
+            catch
+            {
+                envelope.RevisionToken = revision;
+                envelope.Payload = payload;
+                throw;
+            }
         }
         finally { ReleaseLock(mutationLock); }
     }

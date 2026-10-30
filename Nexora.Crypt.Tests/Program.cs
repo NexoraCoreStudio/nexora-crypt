@@ -240,6 +240,50 @@ try
     }
     catch (CryptographicException) { }
 
+    foreach (int format in new[] { 1, 2 })
+    {
+    Console.WriteLine($"[TEST] Ecriture refusee v{format} : rollback memoire, revision et nouvelle tentative");
+    string writeFailurePath = Path.Combine(tempDir, $"WriteFailure{format}", "Nexora.vault");
+    VaultStore.Create(writeFailurePath, "1234");
+    using (var session = VaultStore.OpenOnAuthorizedComputer(writeFailurePath, "1234"))
+    {
+        if (format == 2) VaultFortressMigration.Migrate(session, tempDir);
+        using (var held = new FileStream(writeFailurePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            bool failed = false;
+            try { session.WriteFile("test/failed", new byte[] { 42 }); }
+            catch (IOException) { failed = true; }
+            catch (UnauthorizedAccessException) { failed = true; }
+            Require(failed, "Le verrou doit faire echouer le remplacement");
+        }
+        Require(session.ReadFile("test/failed") is null, "Ecriture non enregistree visible en memoire");
+        session.WriteFile("test/retry", new byte[] { 43 });
+        using (var held = new FileStream(writeFailurePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            try { session.DeleteFile("test/retry"); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+        Require(session.ReadFile("test/retry") is not null, "Suppression refusee visible en memoire");
+        session.WriteFile("test/after-delete", new byte[] { 44 });
+        int slots = JsonNode.Parse(File.ReadAllText(writeFailurePath))!["AuthorizedDevices"]!.AsArray().Count;
+        using (var held = new FileStream(writeFailurePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            try { session.AuthorizeThisComputer(); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+        session.RecordAudit("retry-after-authorization");
+        Require(JsonNode.Parse(File.ReadAllText(writeFailurePath))!["AuthorizedDevices"]!.AsArray().Count == slots,
+            "Une autorisation refusee ne doit pas persister lors de la sauvegarde suivante");
+    }
+    using (var session = VaultStore.OpenOnAuthorizedComputer(writeFailurePath, "1234"))
+    {
+        Require(session.ReadFile("test/failed") is null, "Ecriture refusee persistee");
+        Require(session.ReadFile("test/retry")!.SequenceEqual(new byte[] { 43 }), "Nouvelle tentative non persistee");
+    }
+    }
+
     Console.WriteLine("TOUS LES TESTS NEXORA CRYPT ONT REUSSI");
     return 0;
 }

@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Text.Json;
 
 namespace Nexora.Crypt;
 
@@ -14,6 +15,7 @@ public sealed class VaultSession : IDisposable
     private VaultDocument _document;
     private readonly byte[] _masterKey;
     private bool _disposed;
+    private byte[] _committedEnvelope;
 
     internal VaultSession(string path, VaultEnvelope envelope, VaultDocument document, byte[] masterKey)
     {
@@ -21,6 +23,7 @@ public sealed class VaultSession : IDisposable
         _envelope = envelope;
         _document = document;
         _masterKey = masterKey;
+        _committedEnvelope = JsonSerializer.SerializeToUtf8Bytes(envelope);
     }
 
     public bool IsFortressV2 { get { EnsureOpen(); return _envelope.Version == 2; } }
@@ -92,6 +95,7 @@ public sealed class VaultSession : IDisposable
             backupDirectory, out var migratedEnvelope, out var migratedDocument);
         _envelope = migratedEnvelope;
         _document = migratedDocument;
+        _committedEnvelope = JsonSerializer.SerializeToUtf8Bytes(_envelope);
         return result;
     }
 
@@ -169,7 +173,21 @@ public sealed class VaultSession : IDisposable
         Save();
     }
 
-    private void Save() => VaultPersistence.SaveExisting(_path, _envelope, _document, _masterKey);
+    private void Save()
+    {
+        try
+        {
+            VaultPersistence.SaveExisting(_path, _envelope, _document, _masterKey);
+            _committedEnvelope = JsonSerializer.SerializeToUtf8Bytes(_envelope);
+        }
+        catch
+        {
+            // Restore the last authenticated committed document, not the mutated state.
+            _envelope = JsonSerializer.Deserialize<VaultEnvelope>(_committedEnvelope)!;
+            _document = VaultPersistence.Decode(_masterKey, _envelope);
+            throw;
+        }
+    }
 
     internal static void AppendAudit(VaultDocument document, string eventType)
     {
